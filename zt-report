@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="${HOME}/.local/bin:/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "Missing required command: $1" >&2
+    exit 1
+  fi
+}
+
+has_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+need_cmd jq
+need_cmd curl
+
+LOCAL_AUTHTOKEN="${ZEROTIER_LOCAL_AUTHTOKEN:-${ZT_LOCAL_AUTHTOKEN:-}}"
+ONLINE_WINDOW_SECONDS="${ZT_ONLINE_WINDOW_SECONDS:-120}"
+
+if ! printf '%s' "${ONLINE_WINDOW_SECONDS}" | grep -Eq '^[0-9]+$'; then
+  echo "ZT_ONLINE_WINDOW_SECONDS must be an integer (seconds)." >&2
+  exit 1
+fi
+
+HAS_ZT_CLI=0
+if has_cmd zerotier-cli; then
+  HAS_ZT_CLI=1
+fi
+
+run_zt() {
+  local out=""
+  local out_sudo=""
+  local rc=0
+  local rc_sudo=0
+  local cmd=(zerotier-cli)
+  if [ -n "${LOCAL_AUTHTOKEN}" ]; then
+    cmd+=("-T${LOCAL_AUTHTOKEN}")
+  fi
+  cmd+=("$@")
+
+  if out="$("${cmd[@]}" 2>&1)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+
+  if [ "${rc}" -eq 0 ] && ! printf '%s\n' "${out}" | grep -Eq 'authtoken.secret not found or readable'; then
+    printf '%s\n' "${out}"
+    return 0
+  fi
+
+  if command -v sudo >/dev/null 2>&1; then
+    if out_sudo="$(sudo -n "${cmd[@]}" 2>&1)"; then
+      rc_sudo=0
+    else
+      rc_sudo=$?
+    fi
+
+    if [ "${rc_sudo}" -eq 0 ] && ! printf '%s\n' "${out_sudo}" | grep -Eq 'authtoken.secret not found or readable|password is required'; then
+      printf '%s\n' "${out_sudo}"
+      return 0
+    fi
+  fi
+
+  printf '%s\n' "${out}" >&2
+  if [ -n "${out_sudo}" ]; then
+    printf '%s\n' "${out_sudo}" >&2
+  fi
+
+  if printf '%s\n%s\n' "${out}" "${out_sudo}" | grep -Eq 'authtoken.secret not found or readable|password is required'; then
+    cat >&2 <<'EOF'
+Local ZeroTier CLI auth failed on this host.
+`ZEROTIER_CENTRAL_TOKEN` is only for the Central API; it does not replace the local daemon auth token.
+Use one of:
+  1) Run with sudo (preserve Central token env):
+     sudo --preserve-env=ZEROTIER_CENTRAL_TOKEN,ZT_CENTRAL_TOKEN ~/.local/bin/zt-report
+  2) Export local daemon auth token for this shell:
+     export ZEROTIER_LOCAL_AUTHTOKEN="$(sudo cat /var/lib/zerotier-one/authtoken.secret)"
+     ~/.local/bin/zt-report
+EOF
+  fi
+
+  return 1
+}
+
+TOKEN="${ZEROTIER_CENTRAL_TOKEN:-${ZT_CENTRAL_TOKEN:-}}"
+if [ -z "${TOKEN}" ]; then
+  echo "Missing ZeroTier Central token. Set ZEROTIER_CENTRAL_TOKEN (or ZT_CENTRAL_TOKEN)." >&2
+  exit 1
+fi
+
+NETWORK_ID="${1:-${ZT_NETWORK_ID:-}}"
+if [ -z "${NETWORK_ID}" ] && [ "${HAS_ZT_CLI}" -eq 1 ]; then
+  if LISTNETWORKS_JSON="$(run_zt -j listnetworks 2>/dev/null)"; then
+    NETWORK_ID="$(printf '%s\n' "${LISTNETWORKS_JSON}" | jq -r 'map(select(.status=="OK"))[0].nwid // .[0].nwid // empty')"
+  fi
+fi
+if [ -z "${NETWORK_ID}" ]; then
+  NETWORK_ID="$(curl -fsS -H "Authorization: bearer ${TOKEN}" "https://api.zerotier.com/api/v1/network" | jq -r '.[0].id // empty')"
+fi
+if [ -z "${NETWORK_ID}" ]; then
+  echo "No ZeroTier network found. Pass a network ID: zt-report <nwid> (or set ZT_NETWORK_ID)." >&2
+  exit 1
+fi
+
+LOCAL_MODE=0
+LOCAL_NODE=""
+PEERS_JSON='[]'
+if [ "${HAS_ZT_CLI}" -eq 1 ]; then
+  if INFO_JSON="$(run_zt -j info 2>/dev/null)" && PEERS_JSON_TMP="$(run_zt -j listpeers 2>/dev/null)"; then
+    LOCAL_MODE=1
+    LOCAL_NODE="$(printf '%s\n' "${INFO_JSON}" | jq -r '.address // ""')"
+    PEERS_JSON="${PEERS_JSON_TMP}"
+  fi
+fi
+MEMBERS_JSON="$(curl -fsS -H "Authorization: bearer ${TOKEN}" "https://api.zerotier.com/api/v1/network/${NETWORK_ID}/member")"
+
+echo "Network: ${NETWORK_ID}"
+echo "Generated: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+if [ "${LOCAL_MODE}" -eq 1 ]; then
+  echo "Mode: local+central"
+else
+  echo "Mode: central-only (local zerotier-cli auth unavailable)"
+fi
+echo
+
+jq -r -n \
+  --argjson local_mode "${LOCAL_MODE}" \
+  --argjson online_window_seconds "${ONLINE_WINDOW_SECONDS}" \
+  --arg local_node "${LOCAL_NODE}" \
+  --argjson peers "${PEERS_JSON}" \
+  --argjson members "${MEMBERS_JSON}" '
+  def z2: tostring | if length == 1 then "0" + . else . end;
+  def is_online_central($last_online_ms; $window_seconds):
+    ($last_online_ms // 0) as $ts
+    | ($ts > 0 and ((now * 1000 - $ts) <= ($window_seconds * 1000)));
+  def since_dhm($last_online_ms):
+    ((now - ($last_online_ms / 1000)) | floor) as $age_s
+    | (if $age_s < 0 then 0 else $age_s end) as $s
+    | ($s / 86400 | floor) as $d
+    | (($s % 86400) / 3600 | floor) as $h
+    | (($s % 3600) / 60 | floor) as $m
+    | "\($d):\($h | z2):\($m | z2)";
+
+  ($peers | map(select(.role=="LEAF") | .address)) as $leaf_ids
+  | ($members | map(.nodeId)) as $member_ids
+  | ($members
+      | map(
+          .nodeId as $id
+          | (
+              if $local_mode == 1
+              then (($id == $local_node) or (($leaf_ids | index($id)) != null))
+              else is_online_central(.lastOnline; $online_window_seconds)
+              end
+            ) as $is_online
+          | {
+              alias: (.name // "(no name)"),
+              node_id: $id,
+              zt_ips: ((.config.ipAssignments // []) | join(",")),
+              visible: (
+                if ($local_mode == 1 and $id == $local_node) then "yes(self)"
+                elif $is_online then "yes"
+                else "no"
+                end
+              ),
+              authorized: ((.config.authorized // false) | tostring),
+              last_online: (
+                if $is_online then "-"
+                elif (.lastOnline? != null and .lastOnline > 0)
+                then since_dhm(.lastOnline)
+                else "-"
+                end
+              ),
+              client_version: (.clientVersion // "-")
+            }
+        )
+    ) as $member_rows
+  | (
+      if $local_mode == 1
+      then ($peers
+        | map(select(.role=="LEAF" and (.address as $a | ($member_ids | index($a) == null))))
+        | map({
+            alias: "(not in Central member list)",
+            node_id: .address,
+            zt_ips: "-",
+            visible: "yes",
+            authorized: "-",
+            last_online: "-",
+            client_version: (.version // "-")
+          }))
+      else []
+      end
+    ) as $orphan_rows
+  | ($member_rows + $orphan_rows)
+  | sort_by((.alias + "|" + .node_id) | ascii_downcase)
+  | (["ALIAS","NODE_ID","ZT_IPS","VISIBLE","AUTHORIZED","SINCE_LAST_ONLINE_D:H:M","CLIENT_VERSION"] | @tsv),
+    (.[] | [.alias, .node_id, .zt_ips, .visible, .authorized, .last_online, .client_version] | @tsv)
+' | column -t -s $'\t'
